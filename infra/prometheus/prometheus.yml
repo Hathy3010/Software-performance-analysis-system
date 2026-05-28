@@ -1,0 +1,68 @@
+# =============================================================================
+# AIOps Platform — Prometheus Configuration
+# =============================================================================
+
+global:
+  scrape_interval:     15s   # how often to scrape targets
+  evaluation_interval: 15s   # how often to evaluate rules
+  scrape_timeout:      10s
+
+  external_labels:
+    environment: 'development'
+    project:     'aiops'
+
+# -----------------------------------------------------------------------------
+# Alerting (future: connect to Alertmanager)
+# -----------------------------------------------------------------------------
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['alertmanager:9093']
+
+# -----------------------------------------------------------------------------
+# Rule files (future: add alerting / recording rules here)
+# -----------------------------------------------------------------------------
+# rule_files:
+#   - "/etc/prometheus/rules/*.yml"
+
+# -----------------------------------------------------------------------------
+# Scrape Configs
+# -----------------------------------------------------------------------------
+scrape_configs:
+
+  # Prometheus scrapes itself
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # OpenTelemetry Collector — metrics forwarded from instrumented apps
+  # (otel-collector exports collected metrics on :8889 in Prometheus format)
+  - job_name: otel-collector
+    static_configs:
+      - targets: ['otel-collector:8889']
+    metric_relabel_configs:
+      # drop internal otel build-info metrics to reduce cardinality
+      - source_labels: [__name__]
+        regex: 'otel_build_info'
+        action: drop
+
+  # FastAPI Backend — exposes /metrics via prometheus-fastapi-instrumentator
+  - job_name: aiops-platform
+    static_configs:
+      - targets: ['backend:8000']
+    metrics_path: /metrics
+    scrape_interval: 10s
+
+  # AI Engine — exposes /metrics (Prometheus Python client)
+  - job_name: ai-engine
+    static_configs:
+      - targets: ['ai-engine:8001']
+    metrics_path: /metrics
+    scrape_interval: 30s  # slower — detection runs on a 60s cycle
+
+  # Demo App — instrumented microservice simulating e-commerce storefront
+  - job_name: storefront-service
+    static_configs:
+      - targets: ['demo-app:8080']
+    metrics_path: /metrics
+    scrape_interval: 10s

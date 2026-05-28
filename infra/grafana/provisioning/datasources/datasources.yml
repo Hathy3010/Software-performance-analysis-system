@@ -1,0 +1,53 @@
+# =============================================================================
+# AIOps Platform — Grafana Datasource Provisioning
+# Auto-loaded on container start. Changes here apply after grafana restart.
+# =============================================================================
+
+apiVersion: 1
+
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+  - name: Jaeger
+    orgId: 1
+
+datasources:
+  # ---------------------------------------------------------------------------
+  # Prometheus — primary metrics source
+  # ---------------------------------------------------------------------------
+  - name:      Prometheus
+    type:      prometheus
+    uid:       prometheus-aiops
+    orgId:     1
+    url:       http://prometheus:9090
+    access:    proxy
+    isDefault: true
+    editable:  false
+    jsonData:
+      httpMethod:            POST
+      timeInterval:          "15s"
+      queryTimeout:          "60s"
+      exemplarTraceIdDestinations:
+        - name:              traceID
+          datasourceUid:     jaeger-aiops  # links exemplars to Jaeger traces
+
+  # ---------------------------------------------------------------------------
+  # Jaeger — distributed tracing
+  # ---------------------------------------------------------------------------
+  - name:      Jaeger
+    type:      jaeger
+    uid:       jaeger-aiops
+    orgId:     1
+    url:       http://jaeger:16686
+    access:    proxy
+    isDefault: false
+    editable:  false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: ""
+      nodeGraph:
+        enabled: true
+      traceQuery:
+        timeShiftEnabled: true
+        spanStartTimeShift: "-1h"
+        spanEndTimeShift:   "1h"

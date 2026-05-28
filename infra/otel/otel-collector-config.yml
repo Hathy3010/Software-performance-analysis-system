@@ -1,0 +1,112 @@
+# =============================================================================
+# AIOps Platform — OpenTelemetry Collector Configuration
+# Receives OTLP from instrumented apps → exports to Jaeger (traces) + Prometheus (metrics)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Extensions
+# ---------------------------------------------------------------------------
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133   # used by Docker healthcheck
+
+  pprof:
+    endpoint: 0.0.0.0:1777    # Go pprof profiling (internal)
+
+  zpages:
+    endpoint: 0.0.0.0:55679   # live pipeline diagnostics (internal)
+
+# ---------------------------------------------------------------------------
+# Receivers  — accept OTLP over gRPC and HTTP
+# ---------------------------------------------------------------------------
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 32
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins:
+            - "http://*"
+            - "https://*"
+
+# ---------------------------------------------------------------------------
+# Processors
+# ---------------------------------------------------------------------------
+processors:
+  # Drop data if memory exceeds limit — prevents OOM in dev environments
+  memory_limiter:
+    check_interval: 1s
+    limit_mib:      512
+    spike_limit_mib: 128
+
+  # Batch sends to reduce export frequency and network overhead
+  batch:
+    timeout:         1s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  # Attach resource attributes (useful for multi-tenant setups)
+  resource:
+    attributes:
+      - key: collector.version
+        value: "0.102.0"
+        action: insert
+
+# ---------------------------------------------------------------------------
+# Exporters
+# ---------------------------------------------------------------------------
+exporters:
+  # Jaeger — receives traces via OTLP gRPC (internal network)
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Prometheus — exposes collected metrics on :8889 for Prometheus to scrape
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: otel
+    const_labels:
+      exported_by: otel-collector
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      enabled: true  # promotes resource attrs to metric labels
+
+  # Debug logger — set verbosity: detailed for troubleshooting
+  debug:
+    verbosity: basic
+
+# ---------------------------------------------------------------------------
+# Pipelines
+# ---------------------------------------------------------------------------
+service:
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    # Traces: OTLP in → batch → Jaeger
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [otlp/jaeger]
+
+    # Metrics: OTLP in → batch → Prometheus exporter
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters:  [prometheus]
+
+    # Logs: OTLP in → debug output (extend later: Loki, Elasticsearch)
+    logs:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug]
+
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      level: basic
+      address: 0.0.0.0:8888  # collector's own internal metrics

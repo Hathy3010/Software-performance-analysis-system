@@ -1,0 +1,319 @@
+# =============================================================================
+# AIOps Platform — Docker Compose
+# =============================================================================
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: aiops-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-aiops}
+      POSTGRES_USER:     ${POSTGRES_USER:-aiops_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?err}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./infra/db/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    networks:
+      - db-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aiops_user} -d ${POSTGRES_DB:-aiops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # FastAPI Backend
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: production
+    container_name: aiops-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:                  postgresql+asyncpg://${POSTGRES_USER:-aiops_user}:${POSTGRES_PASSWORD:?err}@postgres:5432/${POSTGRES_DB:-aiops}
+      SECRET_KEY:                    ${SECRET_KEY:?err}
+      ACCESS_TOKEN_EXPIRE_MINUTES:   ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      REFRESH_TOKEN_EXPIRE_DAYS:     ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      CORS_ORIGINS:                  ${CORS_ORIGINS:-http://localhost:3000}
+      PROMETHEUS_URL:                http://prometheus:9090
+      JAEGER_URL:                    http://jaeger:16686
+      MONITORED_SERVICES:            ${MONITORED_SERVICES:-aiops-platform,storefront-service}
+      OTEL_EXPORTER_OTLP_ENDPOINT:   http://otel-collector:4317
+      OTEL_SERVICE_NAME:             aiops-platform
+      OTEL_RESOURCE_ATTRIBUTES:      service.namespace=prod,service.version=1.0.0
+      ENVIRONMENT:                   ${ENVIRONMENT:-development}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    networks:
+      - db-net
+      - monitoring-net
+      - frontend-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # React Frontend (served via Nginx)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: production
+    container_name: aiops-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL:  ${VITE_API_BASE_URL:-http://localhost:8000}
+      VITE_GRAFANA_URL:   ${VITE_GRAFANA_URL:-http://localhost:3001}
+      VITE_JAEGER_URL:    ${VITE_JAEGER_URL:-http://localhost:16686}
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    networks:
+      - frontend-net
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # AI Engine (anomaly detection + RCA worker)
+  # ---------------------------------------------------------------------------
+  ai-engine:
+    build:
+      context: ./ai-engine
+      dockerfile: Dockerfile
+    container_name: aiops-ai-engine
+    restart: unless-stopped
+    environment:
+      DATABASE_URL:                  postgresql+psycopg2://${POSTGRES_USER:-aiops_user}:${POSTGRES_PASSWORD:?err}@postgres:5432/${POSTGRES_DB:-aiops}
+      PROMETHEUS_URL:                http://prometheus:9090
+      JAEGER_URL:                    http://jaeger:16686
+      MONITORED_SERVICES:            ${MONITORED_SERVICES:-aiops-platform,storefront-service}
+      ANOMALY_SCORE_THRESHOLD:       ${ANOMALY_SCORE_THRESHOLD:-0.70}
+      DETECTION_INTERVAL_SECONDS:    ${DETECTION_INTERVAL_SECONDS:-60}
+      OTEL_EXPORTER_OTLP_ENDPOINT:   http://otel-collector:4317
+      OTEL_SERVICE_NAME:             ai-engine
+      OTEL_RESOURCE_ATTRIBUTES:      service.namespace=prod,service.version=1.0.0
+      ENVIRONMENT:                   ${ENVIRONMENT:-development}
+    networks:
+      - db-net
+      - monitoring-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Demo App (instrumented microservice — generates synthetic traffic + telemetry)
+  # ---------------------------------------------------------------------------
+  demo-app:
+    build:
+      context: ./demo-app
+      dockerfile: Dockerfile
+    container_name: aiops-demo-app
+    restart: unless-stopped
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT:  http://otel-collector:4317
+      OTEL_SERVICE_NAME:            storefront-service
+      OTEL_RESOURCE_ATTRIBUTES:     service.namespace=prod,service.version=1.0.0
+      APP_PORT:                     "8080"
+      SIMULATE_ANOMALIES:           ${SIMULATE_ANOMALIES:-true}
+    ports:
+      - "${DEMO_APP_PORT:-8080}:8080"
+    networks:
+      - monitoring-net
+    depends_on:
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.102.0
+    container_name: aiops-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel/otel-collector-config.yml"]
+    volumes:
+      - ./infra/otel/otel-collector-config.yml:/etc/otel/otel-collector-config.yml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC  — instrumented apps send traces/metrics here
+      - "4318:4318"   # OTLP HTTP  — alternative HTTP endpoint
+      - "8889:8889"   # Prometheus scrape — Prometheus pulls otel metrics here
+    networks:
+      - monitoring-net
+    depends_on:
+      jaeger:
+        condition: service_healthy
+    # No healthcheck — otelcol-contrib is scratch-based (no wget/curl/sh).
+    # Dependents use service_started and handle connection retries themselves.
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Prometheus
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: aiops-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}"
+      - "--web.enable-lifecycle"        # allows POST /-/reload
+      - "--web.enable-admin-api"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - monitoring-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Grafana
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: aiops-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?err}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_AUTH_ANONYMOUS_ENABLED:  "false"
+      GF_SERVER_HTTP_PORT:        "3000"
+      GF_FEATURE_TOGGLES_ENABLE:  "traceqlEditor traceToMetrics"
+      GF_LOG_LEVEL:               ${GRAFANA_LOG_LEVEL:-warn}
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    networks:
+      - monitoring-net
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  # Jaeger (all-in-one with Badger persistent storage)
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: aiops-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      SPAN_STORAGE_TYPE: "memory"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"  # Jaeger UI
+      # 4317 / 4318 intentionally NOT published to host —
+      # all OTLP traffic routes through otel-collector instead
+    networks:
+      - monitoring-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:14269/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *default-logging
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  db-net:
+    # postgres ↔ backend ↔ ai-engine only
+    driver: bridge
+    internal: true
+
+  monitoring-net:
+    # otel-collector ↔ prometheus ↔ grafana ↔ jaeger ↔ backend ↔ ai-engine ↔ demo-app
+    driver: bridge
+
+  frontend-net:
+    # frontend ↔ backend only
+    driver: bridge
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
